@@ -1215,13 +1215,16 @@ export class DaemonClient {
     }
 
     this.shouldReconnect = true;
-    this.connectPromise = new Promise((resolve, reject) => {
+    const connectPromise = new Promise<void>((resolve, reject) => {
       this.connectResolve = resolve;
       this.connectReject = reject;
-      this.attemptConnect();
     });
+    this.connectPromise = connectPromise;
+    if (this.connectionState.status !== "connecting" && !this.reconnectTimeout) {
+      this.attemptConnect();
+    }
 
-    return this.connectPromise;
+    return connectPromise;
   }
 
   private attemptConnect(): void {
@@ -1377,7 +1380,6 @@ export class DaemonClient {
         event: "CONNECT_FAILED",
         reasonCode: "connect_failed",
       });
-      this.rejectConnect(error instanceof Error ? error : new Error(message));
     }
   }
 
@@ -1404,9 +1406,7 @@ export class DaemonClient {
       return;
     }
     this.shouldReconnect = false;
-    this.connectPromise = null;
-    this.connectResolve = null;
-    this.connectReject = null;
+    this.rejectConnect(new Error("Daemon client closed"));
     if (this.reconnectTimeout) {
       clearTimeout(this.reconnectTimeout);
       this.reconnectTimeout = null;
@@ -1453,7 +1453,7 @@ export class DaemonClient {
       this.attemptConnect();
       return;
     }
-    void this.connect();
+    void this.connect().catch(() => undefined);
   }
 
   getConnectionState(): ConnectionState {
