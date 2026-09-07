@@ -4800,6 +4800,12 @@ export class DaemonClient {
     config: MutableDaemonConfigPatch,
     requestId?: string,
   ): Promise<{ requestId: string; config: MutableDaemonConfig }> {
+    if (config.mcp && Object.hasOwn(config.mcp, "injectIntoProviders")) {
+      const supportCheck = this.requireProviderScopedPaseoToolsSupport();
+      if (supportCheck) {
+        await supportCheck;
+      }
+    }
     return this.sendCorrelatedSessionRequest({
       requestId,
       message: {
@@ -5640,6 +5646,20 @@ export class DaemonClient {
     // COMPAT(hubRelationship): added in v0.1.X, drop the gate when floor >= v0.1.X.
     if (this.lastServerInfoMessage?.features?.hubRelationship !== true) {
       throw new Error("Update the host to use Hub relationship management.");
+    }
+  }
+
+  private requireProviderScopedPaseoToolsSupport(): Promise<void> | void {
+    // COMPAT(providerScopedPaseoTools): added in v0.2.6, remove gate after 2027-02-04 once daemon floor >= v0.2.6.
+    if (this.connectionState.status === "connecting" || this.reconnectTimeout) {
+      return this.connect().then(() => this.assertProviderScopedPaseoToolsSupport());
+    }
+    this.assertProviderScopedPaseoToolsSupport();
+  }
+
+  private assertProviderScopedPaseoToolsSupport(): void {
+    if (this.lastServerInfoMessage?.features?.providerScopedPaseoTools !== true) {
+      throw new Error("Update the host to configure provider-scoped Paseo tools.");
     }
   }
 

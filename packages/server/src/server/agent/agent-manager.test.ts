@@ -3083,6 +3083,296 @@ test("createAgent passes native Paseo tools through launch context without inter
   });
 });
 
+test("provider allowlist uses exact configured IDs for MCP fallback on create and resume", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-mcp-policy-"));
+  const peer = new McpCapableTestAgentClient("codex-peer");
+  const lead = new McpCapableTestAgentClient("codex-lead");
+  const manager = new AgentManager({
+    clients: {
+      "codex-peer": peer,
+      "codex-lead": lead,
+    },
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+    paseoToolProviderIds: ["codex-supervisor", "codex-lead"],
+  });
+
+  try {
+    const denied = await manager.createAgent(
+      {
+        provider: "codex-peer",
+        cwd: workdir,
+        mcpServers: {
+          paseo: {
+            type: "http",
+            url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=stale-peer",
+          },
+          custom: { type: "stdio", command: "custom-mcp" },
+        },
+      },
+      undefined,
+      { workspaceId: undefined },
+    );
+    const allowed = await manager.createAgent({ provider: "codex-lead", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.resumeAgentFromPersistence(
+      {
+        provider: "codex-peer",
+        sessionId: "peer-persisted",
+        metadata: { cwd: workdir },
+      },
+      {
+        cwd: workdir,
+        mcpServers: {
+          paseo: {
+            type: "http",
+            url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=stale-resume",
+          },
+        },
+      },
+    );
+
+    expect(peer.createdConfigs[0]?.mcpServers).toEqual({
+      custom: { type: "stdio", command: "custom-mcp" },
+    });
+    expect(denied.config.mcpServers).toEqual({
+      custom: { type: "stdio", command: "custom-mcp" },
+    });
+    expect(peer.resumeOverrides[0]?.mcpServers).toBeUndefined();
+    expect(lead.createdConfigs[0]?.mcpServers?.paseo).toEqual({
+      type: "http",
+      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${allowed.id}`,
+    });
+
+    manager.setPaseoToolsEnabled(false);
+    await manager.createAgent({ provider: "codex-lead", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    expect(lead.createdConfigs[1]?.mcpServers?.paseo).toBeUndefined();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider allowlist applies to imported provider sessions", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-import-policy-"));
+
+  class ImportCaptureClient extends McpCapableTestAgentClient {
+    readonly importContexts: ImportProviderSessionContext[] = [];
+
+    override async importSession(
+      input: ImportProviderSessionInput,
+      context: ImportProviderSessionContext,
+    ) {
+      this.importContexts.push(context);
+      return {
+        session: new McpCapableTestAgentSession(context.config),
+        config: {
+          provider: this.provider,
+          cwd: workdir,
+          mcpServers: {
+            paseo: {
+              type: "http" as const,
+              url: "http://127.0.0.1:6767/mcp/agents?callerAgentId=stale-import",
+            },
+          },
+        },
+        persistence: {
+          provider: this.provider,
+          sessionId: input.providerHandleId,
+        },
+        timeline: [],
+      };
+    }
+  }
+
+  const peer = new ImportCaptureClient("codex-peer");
+  const lead = new ImportCaptureClient("codex-lead");
+  const manager = new AgentManager({
+    clients: {
+      "codex-peer": peer,
+      "codex-lead": lead,
+    },
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+    paseoToolProviderIds: ["codex-supervisor", "codex-lead"],
+  });
+
+  try {
+    const denied = await manager.importProviderSession({
+      provider: "codex-peer",
+      providerHandleId: "peer-import",
+      cwd: workdir,
+      workspaceId: "peer-workspace",
+    });
+    const allowed = await manager.importProviderSession({
+      provider: "codex-lead",
+      providerHandleId: "lead-import",
+      cwd: workdir,
+      workspaceId: "lead-workspace",
+    });
+
+    expect(peer.importContexts[0]?.config.mcpServers?.paseo).toBeUndefined();
+    expect(denied.config.mcpServers?.paseo).toBeUndefined();
+    expect(lead.importContexts[0]?.config.mcpServers?.paseo).toEqual({
+      type: "http",
+      url: `http://127.0.0.1:6767/mcp/agents?callerAgentId=${allowed.id}`,
+    });
+    expect(allowed.config.mcpServers?.paseo).toBeUndefined();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("provider allowlist gates native Paseo tools and supports runtime updates", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-native-policy-"));
+  const paseoTools: PaseoToolCatalog = {
+    tools: new Map(),
+    getTool: () => undefined,
+    executeTool: async () => {
+      throw new Error("No tools registered in test catalog");
+    },
+  };
+
+  class NativeCaptureClient extends TestAgentClient {
+    override readonly capabilities = {
+      ...TEST_CAPABILITIES,
+      supportsMcpServers: true,
+      supportsNativePaseoTools: true,
+    };
+    readonly launchContexts: Array<AgentLaunchContext | undefined> = [];
+
+    override async createSession(
+      config: AgentSessionConfig,
+      launchContext?: AgentLaunchContext,
+    ): Promise<AgentSession> {
+      this.createdConfigs.push(config);
+      this.launchContexts.push(launchContext);
+      return new McpCapableTestAgentSession(config);
+    }
+  }
+
+  const peer = new NativeCaptureClient("codex-peer");
+  const lead = new NativeCaptureClient("codex-lead");
+  const manager = new AgentManager({
+    clients: {
+      "codex-peer": peer,
+      "codex-lead": lead,
+    },
+    logger,
+    mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+    paseoToolCatalogFactory: () => paseoTools,
+    paseoToolProviderIds: ["codex-supervisor", "codex-lead"],
+  });
+
+  try {
+    await manager.createAgent({ provider: "codex-peer", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    await manager.createAgent({ provider: "codex-lead", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    expect(peer.launchContexts[0]?.paseoTools).toBeUndefined();
+    expect(peer.createdConfigs[0]?.mcpServers?.paseo).toBeUndefined();
+    expect(lead.launchContexts[0]?.paseoTools).toBe(paseoTools);
+    expect(lead.createdConfigs[0]?.mcpServers?.paseo).toBeUndefined();
+
+    manager.setPaseoToolProviderIds([]);
+    await manager.createAgent({ provider: "codex-lead", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+
+    expect(lead.launchContexts[1]?.paseoTools).toBeUndefined();
+    expect(lead.createdConfigs[1]?.mcpServers?.paseo).toBeUndefined();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test.each([false, true])(
+  "provider policy only narrows the allowlist with native tools=%s",
+  async (supportsNativePaseoTools) => {
+    const workdir = mkdtempSync(join(tmpdir(), "agent-manager-provider-policy-intersection-"));
+    class PolicyCaptureClient extends McpCapableTestAgentClient {
+      override readonly capabilities = {
+        ...TEST_CAPABILITIES,
+        supportsMcpServers: true,
+        supportsNativePaseoTools,
+      };
+      readonly launchContexts: Array<AgentLaunchContext | undefined> = [];
+
+      override async createSession(
+        config: AgentSessionConfig,
+        launchContext?: AgentLaunchContext,
+      ): Promise<AgentSession> {
+        this.launchContexts.push(launchContext);
+        return super.createSession(config);
+      }
+    }
+    const lead = new PolicyCaptureClient("codex-lead");
+    const peer = new PolicyCaptureClient("codex-peer");
+    const policies = new Map<AgentProvider, { enabled?: boolean; disabledTools?: string[] }>([
+      ["codex-lead", { disabledTools: ["create_agent"] }],
+      ["codex-peer", { enabled: true }],
+    ]);
+    const policyInputs: unknown[] = [];
+    const paseoTools: PaseoToolCatalog = {
+      tools: new Map(),
+      getTool: () => undefined,
+      executeTool: async () => {
+        throw new Error("No tools registered in test catalog");
+      },
+    };
+    const manager = new AgentManager({
+      clients: { "codex-lead": lead, "codex-peer": peer },
+      logger,
+      mcpBaseUrl: "http://127.0.0.1:6767/mcp/agents",
+      paseoToolProviderIds: ["codex-lead"],
+      resolvePaseoToolPolicy: (provider) => policies.get(provider),
+      paseoToolCatalogFactory: (context) => {
+        policyInputs.push(context.paseoToolPolicy);
+        return paseoTools;
+      },
+    });
+
+    try {
+      const allowed = await manager.createAgent(
+        { provider: "codex-lead", cwd: workdir },
+        undefined,
+        { workspaceId: undefined },
+      );
+      const denied = await manager.createAgent(
+        { provider: "codex-peer", cwd: workdir },
+        undefined,
+        { workspaceId: undefined },
+      );
+      expect(manager.getPaseoToolPolicy(allowed.id)).toEqual({
+        disabledTools: ["create_agent"],
+      });
+      expect(manager.getPaseoToolPolicy(denied.id)).toEqual({ enabled: false });
+      expect(peer.createdConfigs[0]?.mcpServers?.paseo).toBeUndefined();
+      expect(peer.launchContexts[0]?.paseoTools).toBeUndefined();
+      expect(policyInputs).toEqual(
+        supportsNativePaseoTools ? [{ disabledTools: ["create_agent"] }] : [],
+      );
+
+      policies.set("codex-lead", { enabled: false });
+      const disabled = await manager.createAgent(
+        { provider: "codex-lead", cwd: workdir },
+        undefined,
+        { workspaceId: undefined },
+      );
+      expect(manager.getPaseoToolPolicy(disabled.id)).toEqual({ enabled: false });
+      expect(lead.createdConfigs[1]?.mcpServers?.paseo).toBeUndefined();
+      expect(lead.launchContexts[1]?.paseoTools).toBeUndefined();
+    } finally {
+      rmSync(workdir, { recursive: true, force: true });
+    }
+  },
+);
+
 test("createAgent allows best-effort internal MCP when the provider session reports no support", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-test-"));
   const storagePath = join(workdir, "agents");

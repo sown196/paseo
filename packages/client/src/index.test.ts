@@ -82,9 +82,11 @@ function parseSentFrame(
   return JSON.parse(data);
 }
 
-async function connectClient(
-  features: Record<string, boolean> = { providersSnapshotCwd: true },
-): Promise<{ client: PaseoClient; ws: FakeWebSocket }> {
+function beginConnectingClient(): {
+  client: PaseoClient;
+  ws: FakeWebSocket;
+  connectPromise: Promise<void>;
+} {
   vi.stubGlobal("WebSocket", FakeWebSocket);
   const client = createPaseoClient({
     url: "ws://daemon.test",
@@ -101,6 +103,13 @@ async function connectClient(
     protocolVersion: 1,
   });
   expect(hello.clientId).toEqual(expect.stringMatching(/^paseo-sdk-/));
+  return { client, ws, connectPromise };
+}
+
+async function connectClient(options?: {
+  features?: Record<string, boolean>;
+}): Promise<{ client: PaseoClient; ws: FakeWebSocket }> {
+  const { client, ws, connectPromise } = beginConnectingClient();
   ws.message(
     sessionMessage({
       type: "status",
@@ -109,7 +118,7 @@ async function connectClient(
         serverId: "srv_sdk_test",
         hostname: null,
         version: null,
-        features,
+        features: options?.features ?? { providersSnapshotCwd: true },
       },
     }),
   );
@@ -1296,7 +1305,7 @@ test("provider actions delegate to existing provider RPCs and local snapshot upd
 });
 
 test("waitForReady requires canonical provider snapshot identity from the host", async () => {
-  const { client, ws } = await connectClient({});
+  const { client, ws } = await connectClient({ features: {} });
   const sentBeforeWait = ws.sent.length;
 
   await expect(client.providers.waitForReady({ cwd: "/repo/./sdk" })).rejects.toThrow(
@@ -1307,7 +1316,7 @@ test("waitForReady requires canonical provider snapshot identity from the host",
   await client.close();
 });
 
-test("config actions delegate to existing daemon config RPCs", async () => {
+test("unrelated config actions delegate without provider-policy support", async () => {
   const { client, ws } = await connectClient();
 
   const getPromise = client.config.get("config-get-request");
@@ -1395,6 +1404,157 @@ test("config actions delegate to existing daemon config RPCs", async () => {
       appendSystemPrompt: "",
     },
   });
+
+  await client.close();
+});
+
+test("provider-policy config patches require daemon support before sending", async () => {
+  const { client, ws } = await connectClient();
+  const sentBeforePatches = ws.sent.length;
+
+  for (const injectIntoProviders of [["codex-lead"], [], null] as const) {
+    await expect(client.config.patch({ mcp: { injectIntoProviders } })).rejects.toThrow(
+      "Update the host to configure provider-scoped Paseo tools.",
+    );
+  }
+
+  expect(ws.sent).toHaveLength(sentBeforePatches);
+  await client.close();
+});
+
+test("provider-policy config patches wait for a supported handshake before sending", async () => {
+  const { client, ws, connectPromise } = beginConnectingClient();
+  const patchPromise = client.config.patch(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "config-provider-policy-connecting-supported",
+  );
+
+  expect(ws.sent).toHaveLength(1);
+  ws.message(
+    sessionMessage({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "srv_sdk_test",
+        hostname: null,
+        version: null,
+        features: { providerScopedPaseoTools: true },
+      },
+    }),
+  );
+  await connectPromise;
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
+    type: "set_daemon_config_request",
+    requestId: "config-provider-policy-connecting-supported",
+    config: { mcp: { injectIntoProviders: ["codex-lead"] } },
+  });
+  ws.message(
+    sessionMessage({
+      type: "set_daemon_config_response",
+      payload: {
+        requestId: "config-provider-policy-connecting-supported",
+        config: {
+          mcp: { injectIntoAgents: true, injectIntoProviders: ["codex-lead"] },
+          providers: {},
+          autoArchiveAfterMerge: false,
+        },
+      },
+    }),
+  );
+  await expect(patchPromise).resolves.toMatchObject({
+    requestId: "config-provider-policy-connecting-supported",
+  });
+  await client.close();
+});
+
+test("provider-policy config patches reject an unsupported handshake without sending the field", async () => {
+  const { client, ws, connectPromise } = beginConnectingClient();
+  const patchPromise = client.config.patch(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "config-provider-policy-connecting-unsupported",
+  );
+
+  expect(ws.sent).toHaveLength(1);
+  ws.message(
+    sessionMessage({
+      type: "status",
+      payload: {
+        status: "server_info",
+        serverId: "srv_sdk_test",
+        hostname: null,
+        version: null,
+        features: {},
+      },
+    }),
+  );
+  await connectPromise;
+  await expect(patchPromise).rejects.toThrow(
+    "Update the host to configure provider-scoped Paseo tools.",
+  );
+  expect(ws.sent).toHaveLength(1);
+  await client.close();
+});
+
+test("provider-policy config patches send arrays and reset when daemon supports them", async () => {
+  const { client, ws } = await connectClient({
+    features: { providerScopedPaseoTools: true },
+  });
+  const cases: Array<{
+    requestId: string;
+    injectIntoProviders: string[] | null;
+    responseMcp: { injectIntoAgents: boolean; injectIntoProviders?: string[] };
+  }> = [
+    {
+      requestId: "config-provider-policy-array",
+      injectIntoProviders: ["codex-lead"],
+      responseMcp: { injectIntoAgents: true, injectIntoProviders: ["codex-lead"] },
+    },
+    {
+      requestId: "config-provider-policy-empty",
+      injectIntoProviders: [],
+      responseMcp: { injectIntoAgents: true, injectIntoProviders: [] },
+    },
+    {
+      requestId: "config-provider-policy-reset",
+      injectIntoProviders: null,
+      responseMcp: { injectIntoAgents: true },
+    },
+  ];
+
+  for (const testCase of cases) {
+    const patchPromise = client.config.patch(
+      { mcp: { injectIntoProviders: testCase.injectIntoProviders } },
+      testCase.requestId,
+    );
+    expect(parseSentSessionMessage(ws.sent.at(-1))).toMatchObject({
+      type: "set_daemon_config_request",
+      requestId: testCase.requestId,
+      config: {
+        mcp: { injectIntoProviders: testCase.injectIntoProviders },
+      },
+    });
+    ws.message(
+      sessionMessage({
+        type: "set_daemon_config_response",
+        payload: {
+          requestId: testCase.requestId,
+          config: {
+            mcp: testCase.responseMcp,
+            providers: {},
+            autoArchiveAfterMerge: false,
+          },
+        },
+      }),
+    );
+    await expect(patchPromise).resolves.toMatchObject({
+      requestId: testCase.requestId,
+      config: { mcp: testCase.responseMcp },
+    });
+  }
 
   await client.close();
 });

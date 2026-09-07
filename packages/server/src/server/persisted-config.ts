@@ -17,6 +17,7 @@ import {
   TerminalProfileSchema,
 } from "@getpaseo/protocol/messages";
 import { PaseoServicePortAllocationSchema } from "@getpaseo/protocol/paseo-config-schema";
+import { AgentProviderSchema } from "@getpaseo/protocol/provider-manifest";
 
 export const LogLevelSchema = z.enum(["trace", "debug", "info", "warn", "error", "fatal"]);
 export const LogFormatSchema = z.enum(["pretty", "json"]);
@@ -245,6 +246,7 @@ export const PersistedConfigSchema = z
           .object({
             enabled: z.boolean().optional(),
             injectIntoAgents: z.boolean().optional(),
+            injectIntoProviders: z.array(AgentProviderSchema).optional(),
           })
           .passthrough()
           .optional(),

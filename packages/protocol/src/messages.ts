@@ -219,6 +219,7 @@ export const MutableDaemonConfigSchema = z
       .object({
         enabled: z.boolean().optional(),
         injectIntoAgents: z.boolean(),
+        injectIntoProviders: z.array(AgentProviderSchema).optional(),
       })
       .passthrough(),
     hostnames: z.union([z.literal(true), z.array(z.string())]).optional(),
@@ -254,7 +255,13 @@ export const MutableDaemonConfigSchema = z
 export const MutableDaemonConfigPatchSchema = z
   .object({
     relay: MutableRelayConfigSchema.partial().optional(),
-    mcp: z.object({ injectIntoAgents: z.boolean().optional() }).passthrough().optional(),
+    mcp: z
+      .object({
+        injectIntoAgents: z.boolean().optional(),
+        injectIntoProviders: z.union([z.array(AgentProviderSchema), z.null()]).optional(),
+      })
+      .passthrough()
+      .optional(),
     browserTools: MutableBrowserToolsConfigSchema.partial().optional(),
     providers: z
       .record(z.string(), MutableDaemonProviderConfigSchema.partial().passthrough())
@@ -3522,6 +3529,8 @@ export const ServerInfoStatusPayloadSchema = z
         commitBaseClassification: z.boolean().optional(),
         // COMPAT(providerRemoval): added in v0.1.105, drop the gate when floor >= v0.1.105.
         providerRemoval: z.boolean().optional(),
+        // COMPAT(providerScopedPaseoTools): added in v0.2.6, remove gate after 2027-02-04 once daemon floor >= v0.2.6.
+        providerScopedPaseoTools: z.boolean().optional(),
         // COMPAT(importSessionWorkspaceTarget): added in v0.1.110, remove gate after 2027-01-16.
         importSessionWorkspaceTarget: z.boolean().optional(),
         // COMPAT(importSessionSearch): added in v0.7.3, remove gate after 2027-03-02.
