@@ -382,6 +382,260 @@ interface NotifySafelyOptions {
   permissionRequest?: AgentPermissionRequest;
 }
 
+interface PendingCallerNotification {
+  agentStorage: AgentStorage;
+  childAgentId: string;
+  callerAgentId: string;
+  reason: FinishNotificationReason;
+  prompt: string;
+  logger: Logger;
+  attempts: number;
+  expiresAt: number;
+  waitingForIdle: boolean;
+}
+
+interface CallerNotificationQueue {
+  agentManager: AgentManager;
+  callerAgentId: string;
+  notifications: PendingCallerNotification[];
+  unsubscribe: (() => void) | null;
+  wakeTimer: ReturnType<typeof setTimeout> | null;
+  draining: boolean;
+}
+
+const CALLER_NOTIFICATION_MAX_ATTEMPTS = 3;
+const CALLER_NOTIFICATION_RETRY_DELAY_MS = 250;
+const CALLER_NOTIFICATION_TIMEOUT_MS = 5 * 60_000;
+const callerNotificationQueues = new WeakMap<AgentManager, Map<string, CallerNotificationQueue>>();
+
+const isCallerBusyError = (params: { error: unknown; callerAgentId: string }): boolean => {
+  return (
+    params.error instanceof Error &&
+    params.error.message === `Agent ${params.callerAgentId} already has an active run`
+  );
+};
+
+const cleanupCallerNotificationQueue = (queue: CallerNotificationQueue): void => {
+  queue.unsubscribe?.();
+  queue.unsubscribe = null;
+  if (queue.wakeTimer) {
+    clearTimeout(queue.wakeTimer);
+    queue.wakeTimer = null;
+  }
+  const queues = callerNotificationQueues.get(queue.agentManager);
+  queues?.delete(queue.callerAgentId);
+  if (queues?.size === 0) {
+    callerNotificationQueues.delete(queue.agentManager);
+  }
+};
+
+const logAbandonedCallerNotifications = (params: {
+  queue: CallerNotificationQueue;
+  cause: "archived" | "closed";
+}): void => {
+  const { queue, cause } = params;
+  for (const notification of queue.notifications) {
+    notification.logger.warn(
+      {
+        childAgentId: notification.childAgentId,
+        callerAgentId: notification.callerAgentId,
+        reason: notification.reason,
+        cause,
+      },
+      "Abandoned caller agent notification",
+    );
+  }
+  queue.notifications.length = 0;
+  cleanupCallerNotificationQueue(queue);
+};
+
+const scheduleCallerNotificationWake = (params: {
+  queue: CallerNotificationQueue;
+  delayMs: number;
+}): void => {
+  const { queue, delayMs } = params;
+  if (queue.wakeTimer) {
+    clearTimeout(queue.wakeTimer);
+  }
+  const notification = queue.notifications[0];
+  if (!notification) {
+    cleanupCallerNotificationQueue(queue);
+    return;
+  }
+  const untilExpiry = Math.max(0, notification.expiresAt - Date.now());
+  queue.wakeTimer = setTimeout(
+    () => {
+      queue.wakeTimer = null;
+      void drainCallerNotificationQueue(queue);
+    },
+    Math.min(delayMs, untilExpiry),
+  );
+};
+
+const shouldRetryCallerNotification = (params: {
+  error: unknown;
+  notification: PendingCallerNotification;
+}): boolean => {
+  const { error, notification } = params;
+  if (!isCallerBusyError({ error, callerAgentId: notification.callerAgentId })) {
+    notification.logger.error(
+      {
+        err: error,
+        childAgentId: notification.childAgentId,
+        callerAgentId: notification.callerAgentId,
+        reason: notification.reason,
+      },
+      "Failed to notify caller agent",
+    );
+    return false;
+  }
+  if (notification.attempts < CALLER_NOTIFICATION_MAX_ATTEMPTS) {
+    return true;
+  }
+  notification.logger.error(
+    {
+      err: error,
+      childAgentId: notification.childAgentId,
+      callerAgentId: notification.callerAgentId,
+      reason: notification.reason,
+      attempts: notification.attempts,
+    },
+    "Gave up notifying caller agent",
+  );
+  return false;
+};
+
+const drainCallerNotificationQueue = async (queue: CallerNotificationQueue): Promise<void> => {
+  if (queue.draining) return;
+  queue.draining = true;
+  if (queue.wakeTimer) {
+    clearTimeout(queue.wakeTimer);
+    queue.wakeTimer = null;
+  }
+
+  try {
+    while (queue.notifications.length > 0) {
+      const notification = queue.notifications[0];
+      if (!notification) break;
+
+      if (Date.now() >= notification.expiresAt) {
+        notification.logger.error(
+          {
+            childAgentId: notification.childAgentId,
+            callerAgentId: notification.callerAgentId,
+            reason: notification.reason,
+            attempts: notification.attempts,
+          },
+          "Gave up notifying caller agent",
+        );
+        queue.notifications.shift();
+        continue;
+      }
+
+      const callerRecord = await notification.agentStorage.get(notification.callerAgentId);
+      if (callerRecord?.archivedAt) {
+        logAbandonedCallerNotifications({ queue, cause: "archived" });
+        return;
+      }
+
+      const caller = queue.agentManager.getAgent(notification.callerAgentId);
+      if (caller?.lifecycle === "closed") {
+        logAbandonedCallerNotifications({ queue, cause: "closed" });
+        return;
+      }
+      if (
+        notification.waitingForIdle &&
+        (caller?.lifecycle !== "idle" ||
+          queue.agentManager.hasInFlightRun(notification.callerAgentId))
+      ) {
+        scheduleCallerNotificationWake({ queue, delayMs: CALLER_NOTIFICATION_TIMEOUT_MS });
+        return;
+      }
+      notification.waitingForIdle = false;
+
+      try {
+        notification.attempts += 1;
+        // Fork policy: finish notifications use replace-dispatch, not active-turn steering.
+        await sendPromptToAgent({
+          agentManager: queue.agentManager,
+          agentStorage: notification.agentStorage,
+          agentId: notification.callerAgentId,
+          prompt: notification.prompt,
+          unarchive: false,
+          logger: notification.logger,
+        });
+        queue.notifications.shift();
+        const nextNotification = queue.notifications[0];
+        if (nextNotification) {
+          nextNotification.waitingForIdle = true;
+        }
+      } catch (error) {
+        if (shouldRetryCallerNotification({ error, notification })) {
+          notification.waitingForIdle = true;
+          scheduleCallerNotificationWake({
+            queue,
+            delayMs: CALLER_NOTIFICATION_RETRY_DELAY_MS,
+          });
+          return;
+        }
+        queue.notifications.shift();
+      }
+    }
+  } finally {
+    queue.draining = false;
+    if (queue.notifications.length === 0) {
+      cleanupCallerNotificationQueue(queue);
+    }
+  }
+};
+
+const enqueueCallerNotification = (params: {
+  agentManager: AgentManager;
+  notification: Omit<PendingCallerNotification, "attempts" | "expiresAt" | "waitingForIdle">;
+}): void => {
+  const { agentManager, notification } = params;
+  let queues = callerNotificationQueues.get(agentManager);
+  if (!queues) {
+    queues = new Map();
+    callerNotificationQueues.set(agentManager, queues);
+  }
+
+  let queue = queues.get(notification.callerAgentId);
+  if (!queue) {
+    queue = {
+      agentManager,
+      callerAgentId: notification.callerAgentId,
+      notifications: [],
+      unsubscribe: null,
+      wakeTimer: null,
+      draining: false,
+    };
+    queues.set(notification.callerAgentId, queue);
+    const createdQueue = queue;
+    queue.unsubscribe = agentManager.subscribe(
+      (event) => {
+        if (event.type !== "agent_state") return;
+        if (event.agent.lifecycle === "closed") {
+          logAbandonedCallerNotifications({ queue: createdQueue, cause: "closed" });
+          return;
+        }
+        if (event.agent.lifecycle === "idle") {
+          void drainCallerNotificationQueue(createdQueue);
+        }
+      },
+      { agentId: notification.callerAgentId, replayState: false },
+    );
+  }
+
+  queue.notifications.push({
+    ...notification,
+    attempts: 0,
+    expiresAt: Date.now() + CALLER_NOTIFICATION_TIMEOUT_MS,
+    waitingForIdle: queue.notifications.length > 0,
+  });
+  void drainCallerNotificationQueue(queue);
+};
+
 export function setupFinishNotification(params: SetupFinishNotificationParams): void {
   const {
     agentManager,
@@ -409,6 +663,10 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
   ): Promise<void> {
     const callerRecord = await agentStorage.get(callerAgentId);
     if (callerRecord?.archivedAt) {
+      logger.warn(
+        { childAgentId, callerAgentId, reason, cause: "archived" },
+        "Abandoned caller agent notification",
+      );
       return;
     }
 
@@ -426,14 +684,16 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       permissionRequest,
     });
 
-    await sendPromptToAgent({
+    enqueueCallerNotification({
       agentManager,
-      agentStorage,
-      agentId: callerAgentId,
-      prompt: formatSystemNotificationPrompt(body),
-      activeTurnBehavior: "steer",
-      unarchive: false,
-      logger,
+      notification: {
+        agentStorage,
+        childAgentId,
+        callerAgentId,
+        reason,
+        prompt: formatSystemNotificationPrompt(body),
+        logger,
+      },
     });
   }
 
