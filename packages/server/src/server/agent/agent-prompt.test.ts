@@ -11,6 +11,9 @@ import { AgentStorage } from "./agent-storage.js";
 import {
   formatSystemNotificationPrompt,
   isSystemInjectedEnvelope,
+  NOTIFY_ON_FINISH_LABEL,
+  parseNotifyOnFinishLabel,
+  resumeFinishNotificationsOnBoot,
   setupFinishNotification,
   waitForAgentRunStartWithTimeout,
 } from "./agent-prompt.js";
@@ -51,11 +54,19 @@ interface FinishNotificationScenarioOptions {
   childParentAgentId?: string | null;
   requireParentOwnership?: boolean;
   parentPromptError?: Error;
+  parentPromptErrors?: Error[];
+  callerInitiallyRunning?: boolean;
+  childNotifyLabel?: string;
+  childLastStatus?: string;
+  callerDeclinesFinishNotifications?: boolean;
+  callerUnloaded?: boolean;
   logger?: Logger;
 }
 
 interface FinishNotificationScenario {
-  startWatchingChild(): void;
+  startWatchingChild(options?: { persistent?: boolean }): void;
+  resumeOnBoot(): Promise<void>;
+  labelWrites(): Array<Record<string, string>>;
   requestChildPermission(requestId?: string): void;
   resolveChildPermission(requestId?: string): void;
   resolveChildPermissionFromState(requestId?: string): void;
@@ -66,16 +77,23 @@ interface FinishNotificationScenario {
   parentPrompts(): string[];
   steerAttemptCount(): number;
   wasParentPrompted(): boolean;
+  setCallerLifecycle(lifecycle: "running" | "idle" | "error" | "closed"): void;
+  subscriptionCount(agentId: string): number;
+  setCallerDeclinesFinishNotifications(declines: boolean): void;
 }
 
 function createFinishNotificationScenario(
   options?: FinishNotificationScenarioOptions,
 ): FinishNotificationScenario {
-  let subscriber: ((event: AgentManagerEvent) => void) | null = null;
+  const subscribers = new Map<string, Set<(event: AgentManagerEvent) => void>>();
   let resolveParentPrompt: ((prompt: string) => void) | null = null;
   let parentPrompted = false;
   let steerAttemptCount = 0;
   const parentPrompts: string[] = [];
+  const parentPromptErrors = [...(options?.parentPromptErrors ?? [])];
+  if (options?.parentPromptError) {
+    parentPromptErrors.push(options.parentPromptError);
+  }
 
   const childAgent: ManagedAgent = Object.create(null);
   Reflect.set(childAgent, "id", "child-agent");
@@ -85,8 +103,17 @@ function createFinishNotificationScenario(
 
   const callerAgent: ManagedAgent = Object.create(null);
   Reflect.set(callerAgent, "id", "caller-agent");
-  Reflect.set(callerAgent, "lifecycle", "idle");
+  Reflect.set(callerAgent, "lifecycle", options?.callerInitiallyRunning ? "running" : "idle");
   Reflect.set(callerAgent, "config", { title: "Caller Agent" });
+  Reflect.set(callerAgent, "pendingPermissions", new Map());
+  Reflect.set(callerAgent, "provider", "observer-seat");
+  let callerDeclines = options?.callerDeclinesFinishNotifications ?? false;
+
+  const emit = (agentId: string, event: AgentManagerEvent): void => {
+    for (const subscriber of subscribers.get(agentId) ?? []) {
+      subscriber(event);
+    }
+  };
 
   const agentManager = new AgentManager({ clients: {}, logger: createTestLogger() });
   Reflect.set(agentManager, "getAgent", (agentId: string) => {
@@ -94,59 +121,113 @@ function createFinishNotificationScenario(
       return childAgent;
     }
     if (agentId === "caller-agent") {
-      return callerAgent;
+      return options?.callerUnloaded ? null : callerAgent;
     }
     return null;
   });
-  Reflect.set(agentManager, "subscribe", (callback: (event: AgentManagerEvent) => void) => {
-    subscriber = callback;
-    return () => {
-      subscriber = null;
-    };
-  });
+  Reflect.set(agentManager, "resolveProviderPaseoToolPolicy", (provider: string) =>
+    provider === "observer-seat" && callerDeclines ? { finishNotifications: false } : undefined,
+  );
+  Reflect.set(
+    agentManager,
+    "subscribe",
+    (callback: (event: AgentManagerEvent) => void, subscribeOptions?: { agentId?: string }) => {
+      const agentId = subscribeOptions?.agentId ?? "*";
+      let agentSubscribers = subscribers.get(agentId);
+      if (!agentSubscribers) {
+        agentSubscribers = new Set();
+        subscribers.set(agentId, agentSubscribers);
+      }
+      agentSubscribers.add(callback);
+      return () => {
+        agentSubscribers?.delete(callback);
+      };
+    },
+  );
   Reflect.set(agentManager, "getLastAssistantMessage", async () => {
     return options?.childLastAssistantMessage ?? null;
   });
   Reflect.set(agentManager, "tryRunOutOfBand", () => false);
-  Reflect.set(agentManager, "hasInFlightRun", () => Boolean(options?.parentPromptError));
+  Reflect.set(agentManager, "hasInFlightRun", () => callerAgent.lifecycle === "running");
   Reflect.set(agentManager, "steerOrReplaceActiveTurn", async () => {
     steerAttemptCount += 1;
     return { status: "inactive" };
   });
-  Reflect.set(agentManager, "streamAgent", (_agentId: string, prompt: string) => {
+  const dispatchParentPrompt = (prompt: string) => {
+    resolveParentPrompt?.(prompt);
+    const error = parentPromptErrors.shift();
+    if (error) {
+      throw error;
+    }
     parentPrompted = true;
     parentPrompts.push(prompt);
-    resolveParentPrompt?.(prompt);
     return (async function* noop() {})();
+  };
+  Reflect.set(agentManager, "streamAgent", (_agentId: string, prompt: string) => {
+    return dispatchParentPrompt(prompt);
   });
   Reflect.set(agentManager, "replaceAgentRun", async (_agentId: string, prompt: string) => {
-    resolveParentPrompt?.(prompt);
-    throw options?.parentPromptError;
+    return dispatchParentPrompt(prompt);
+  });
+  const labelWrites: Array<Record<string, string>> = [];
+  Reflect.set(
+    agentManager,
+    "setLabels",
+    async (_agentId: string, labels: Record<string, string>) => {
+      labelWrites.push(labels);
+      const current = (childAgent.labels ?? {}) as Record<string, string>;
+      Reflect.set(childAgent, "labels", { ...current, ...labels });
+    },
+  );
+
+  const childLabels = (): Record<string, string> => {
+    const parentAgentId =
+      options?.childParentAgentId === undefined ? "caller-agent" : options.childParentAgentId;
+    return {
+      ...(parentAgentId ? { "paseo.parent-agent-id": parentAgentId } : {}),
+      ...(options?.childNotifyLabel ? { [NOTIFY_ON_FINISH_LABEL]: options.childNotifyLabel } : {}),
+    };
+  };
+  Reflect.set(childAgent, "labels", childLabels());
+  const childRecord = () => ({
+    id: "child-agent",
+    title: "Child Agent",
+    labels: childLabels(),
+    lastStatus: options?.childLastStatus ?? "idle",
   });
 
   const agentStorage: AgentStorage = Object.create(AgentStorage.prototype);
   Reflect.set(agentStorage, "get", async (agentId: string) => {
     if (agentId === "child-agent") {
-      const parentAgentId =
-        options?.childParentAgentId === undefined ? "caller-agent" : options.childParentAgentId;
-      return {
-        title: "Child Agent",
-        labels: parentAgentId ? { "paseo.parent-agent-id": parentAgentId } : {},
-      };
+      return childRecord();
+    }
+    if (agentId === "caller-agent") {
+      return { id: "caller-agent", provider: "observer-seat", labels: {} };
     }
     return null;
   });
+  Reflect.set(agentStorage, "list", async () => [childRecord()]);
+  Reflect.set(agentStorage, "upsert", async () => {});
+
+  const logger = options?.logger ?? createTestLogger();
 
   return {
-    startWatchingChild() {
+    startWatchingChild(watchOptions?: { persistent?: boolean }) {
       setupFinishNotification({
         agentManager,
         agentStorage,
         childAgentId: "child-agent",
         callerAgentId: "caller-agent",
         requireParentOwnership: options?.requireParentOwnership,
-        logger: options?.logger ?? createTestLogger(),
+        persistent: watchOptions?.persistent,
+        logger,
       });
+    },
+    async resumeOnBoot() {
+      await resumeFinishNotificationsOnBoot({ agentManager, agentStorage, logger });
+    },
+    labelWrites() {
+      return labelWrites;
     },
     requestChildPermission(requestId = "permission-1") {
       childAgent.lifecycle = "running";
@@ -161,11 +242,11 @@ function createFinishNotificationScenario(
           content: "PASEO_PERMISSION_NOTIFY_QA_OK\n",
         },
       });
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_state",
         agent: childAgent,
       });
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_stream",
         agentId: "child-agent",
         event: {
@@ -177,7 +258,7 @@ function createFinishNotificationScenario(
     },
     resolveChildPermission(requestId = "permission-1") {
       childAgent.pendingPermissions.delete(requestId);
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_stream",
         agentId: "child-agent",
         event: {
@@ -190,13 +271,13 @@ function createFinishNotificationScenario(
     },
     resolveChildPermissionFromState(requestId = "permission-1") {
       childAgent.pendingPermissions.delete(requestId);
-      subscriber?.({ type: "agent_state", agent: childAgent });
+      emit("child-agent", { type: "agent_state", agent: childAgent });
     },
     resolveChildPermissionWhileIdle(requestId = "permission-1") {
       childAgent.pendingPermissions.delete(requestId);
       childAgent.lifecycle = "idle";
-      subscriber?.({ type: "agent_state", agent: childAgent });
-      subscriber?.({
+      emit("child-agent", { type: "agent_state", agent: childAgent });
+      emit("child-agent", {
         type: "agent_stream",
         agentId: "child-agent",
         event: {
@@ -209,13 +290,13 @@ function createFinishNotificationScenario(
     },
     finishChild() {
       childAgent.lifecycle = "running";
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_state",
         agent: childAgent,
       });
 
       childAgent.lifecycle = "idle";
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_state",
         agent: childAgent,
       });
@@ -234,13 +315,13 @@ function createFinishNotificationScenario(
       });
 
       childAgent.lifecycle = "running";
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_state",
         agent: childAgent,
       });
 
       childAgent.lifecycle = "closed";
-      subscriber?.({
+      emit("child-agent", {
         type: "agent_state",
         agent: childAgent,
       });
@@ -255,6 +336,16 @@ function createFinishNotificationScenario(
     },
     wasParentPrompted() {
       return parentPrompted;
+    },
+    setCallerLifecycle(lifecycle) {
+      callerAgent.lifecycle = lifecycle;
+      emit("caller-agent", { type: "agent_state", agent: callerAgent });
+    },
+    subscriptionCount(agentId) {
+      return subscribers.get(agentId)?.size ?? 0;
+    },
+    setCallerDeclinesFinishNotifications(declines) {
+      callerDeclines = declines;
     },
   };
 }
@@ -277,7 +368,7 @@ test("finish notifications tell the parent the child's last assistant message", 
       "Agent child-agent (Child Agent) finished.\n\n<agent-response>\nImplemented the cleanup and all checks pass.\n</agent-response>",
     ),
   );
-  expect(scenario.steerAttemptCount()).toBe(1);
+  expect(scenario.steerAttemptCount()).toBe(0);
 });
 
 test("finish notifications truncate oversized child responses", async () => {
@@ -306,6 +397,166 @@ test("closing a watched child notifies the caller", async () => {
   expect(parentPrompt).toEqual(
     formatSystemNotificationPrompt("Agent child-agent (Child Agent) was closed."),
   );
+});
+
+test("finish notifications wait for a busy caller and deliver exactly once after idle", async () => {
+  const scenario = createFinishNotificationScenario({
+    callerInitiallyRunning: true,
+    parentPromptErrors: [new Error("Agent caller-agent already has an active run")],
+  });
+
+  scenario.startWatchingChild();
+  scenario.finishChild();
+
+  await vi.waitFor(() => expect(scenario.subscriptionCount("caller-agent")).toBe(1));
+  expect(scenario.parentPrompts()).toHaveLength(0);
+  expect(scenario.subscriptionCount("child-agent")).toBe(0);
+
+  scenario.setCallerLifecycle("idle");
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+
+  scenario.setCallerLifecycle("running");
+  scenario.setCallerLifecycle("idle");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(scenario.parentPrompts()).toHaveLength(1);
+  expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+});
+
+test("finish notifications keep successful running-caller replacement behavior", async () => {
+  const scenario = createFinishNotificationScenario({ callerInitiallyRunning: true });
+
+  scenario.startWatchingChild();
+  scenario.finishChild();
+
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  expect(scenario.parentPrompts()[0]).toContain("finished.");
+  expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+});
+
+test("a notification backlog is coalesced into one ordered parent turn", async () => {
+  const scenario = createFinishNotificationScenario({
+    callerInitiallyRunning: true,
+    parentPromptErrors: [new Error("Agent caller-agent already has an active run")],
+  });
+
+  scenario.startWatchingChild();
+  scenario.requestChildPermission("permission-1");
+  scenario.requestChildPermission("permission-2");
+  scenario.resolveChildPermission("permission-1");
+  scenario.resolveChildPermission("permission-2");
+  scenario.finishChild();
+
+  await vi.waitFor(() => expect(scenario.subscriptionCount("caller-agent")).toBe(1));
+  expect(scenario.parentPrompts()).toHaveLength(0);
+
+  scenario.setCallerLifecycle("idle");
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+
+  const prompt = scenario.parentPrompts()[0];
+  const sectionOffsets = [
+    prompt.indexOf('"requestId": "permission-1"'),
+    prompt.indexOf('"requestId": "permission-2"'),
+    prompt.indexOf("finished."),
+  ];
+  expect(sectionOffsets.every((offset) => offset >= 0)).toBe(true);
+  expect(sectionOffsets).toEqual([...sectionOffsets].sort((a, b) => a - b));
+  expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+});
+
+test("pending finish notifications are abandoned when the caller closes", async () => {
+  const logger = createTestLogger();
+  const warnSpy = vi.spyOn(logger, "warn");
+  const scenario = createFinishNotificationScenario({
+    callerInitiallyRunning: true,
+    parentPromptErrors: [new Error("Agent caller-agent already has an active run")],
+    logger,
+  });
+
+  scenario.startWatchingChild();
+  scenario.finishChild();
+  await vi.waitFor(() => expect(scenario.subscriptionCount("caller-agent")).toBe(1));
+
+  scenario.setCallerLifecycle("closed");
+
+  expect(scenario.parentPrompts()).toHaveLength(0);
+  expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+  expect(warnSpy).toHaveBeenCalledWith(
+    expect.objectContaining({ cause: "closed", reason: "finished" }),
+    "Abandoned caller agent notification",
+  );
+});
+
+test("busy caller retries are bounded and cleaned up", async () => {
+  vi.useFakeTimers();
+  try {
+    const captured = createCapturedLogger();
+    const busyError = new Error("Agent caller-agent already has an active run");
+    const scenario = createFinishNotificationScenario({
+      parentPromptErrors: [busyError, busyError, busyError],
+      logger: captured.logger,
+    });
+
+    scenario.startWatchingChild();
+    scenario.finishChild();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(captured.records).toEqual([
+      expect.objectContaining({
+        msg: "Gave up notifying caller agent",
+        attempts: 3,
+        childAgentId: "child-agent",
+        callerAgentId: "caller-agent",
+      }),
+    ]);
+    // The dropped notification is not lost silently: the caller gets a
+    // missed-notifications summary once delivery works again.
+    expect(scenario.parentPrompts()).toHaveLength(1);
+    expect(scenario.parentPrompts()[0]).toContain("You missed 1 notification");
+    expect(scenario.parentPrompts()[0]).toContain("Agent child-agent: finished");
+    expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("pending finish notifications expire while the caller stays busy", async () => {
+  vi.useFakeTimers();
+  try {
+    const captured = createCapturedLogger();
+    const scenario = createFinishNotificationScenario({
+      callerInitiallyRunning: true,
+      parentPromptErrors: [new Error("Agent caller-agent already has an active run")],
+      logger: captured.logger,
+    });
+
+    scenario.startWatchingChild();
+    scenario.finishChild();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(scenario.subscriptionCount("caller-agent")).toBe(1);
+    expect(scenario.parentPrompts()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(5 * 60_000 - 250);
+    expect(captured.records).toEqual([
+      expect.objectContaining({
+        msg: "Gave up notifying caller agent",
+        attempts: 1,
+        childAgentId: "child-agent",
+        callerAgentId: "caller-agent",
+      }),
+    ]);
+    // The queue stays alive to deliver a missed-notifications summary once
+    // the caller frees up.
+    expect(scenario.subscriptionCount("caller-agent")).toBe(1);
+    expect(scenario.parentPrompts()).toEqual([]);
+    scenario.setCallerLifecycle("idle");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(scenario.parentPrompts()).toHaveLength(1);
+    expect(scenario.parentPrompts()[0]).toContain("You missed 1 notification");
+    expect(scenario.subscriptionCount("caller-agent")).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test("finish notifications survive permission responses", async () => {
@@ -429,6 +680,205 @@ test("follow-up finish notifications do not require a parent relationship", asyn
   expect(parentPrompt).toContain("Agent child-agent (Child Agent) finished.");
 });
 
+test("persistent subscriptions notify on every finish until the child closes", async () => {
+  const scenario = createFinishNotificationScenario();
+
+  scenario.startWatchingChild({ persistent: true });
+  const firstPrompt = await scenario.finishChildAndReadParentPrompt();
+  expect(firstPrompt).toContain("finished.");
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+
+  const secondPrompt = await scenario.finishChildAndReadParentPrompt();
+  expect(secondPrompt).toContain("finished.");
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+
+  const closePrompt = await scenario.closeChildAndReadParentPrompt();
+  expect(closePrompt).toContain("was closed.");
+  await vi.waitFor(() => expect(scenario.subscriptionCount("child-agent")).toBe(0));
+});
+
+test("subscriptions persist to the notify-on-finish label and clear on terminal delivery", async () => {
+  const scenario = createFinishNotificationScenario();
+
+  scenario.startWatchingChild();
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({
+      [NOTIFY_ON_FINISH_LABEL]: "once:caller-agent",
+    }),
+  );
+
+  await scenario.finishChildAndReadParentPrompt();
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({ [NOTIFY_ON_FINISH_LABEL]: "" }),
+  );
+});
+
+test("watching the same child twice replaces the stale subscription instead of stacking", async () => {
+  const scenario = createFinishNotificationScenario();
+
+  scenario.startWatchingChild();
+  scenario.startWatchingChild();
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+
+  await scenario.finishChildAndReadParentPrompt();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(scenario.parentPrompts()).toHaveLength(1);
+});
+
+test("boot resume re-establishes an always subscription and reports an interrupted run", async () => {
+  const scenario = createFinishNotificationScenario({
+    childNotifyLabel: "always:caller-agent",
+    childLastStatus: "running",
+  });
+
+  await scenario.resumeOnBoot();
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  expect(scenario.parentPrompts()[0]).toContain(
+    "Agent child-agent (Child Agent) was interrupted by a daemon restart.",
+  );
+
+  const followUpPrompt = await scenario.finishChildAndReadParentPrompt();
+  expect(followUpPrompt).toContain("finished.");
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+});
+
+test("boot resume does not report an always child that was idle at shutdown", async () => {
+  const scenario = createFinishNotificationScenario({
+    childNotifyLabel: "always:caller-agent",
+    childLastStatus: "idle",
+  });
+
+  await scenario.resumeOnBoot();
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(scenario.parentPrompts()).toHaveLength(0);
+});
+
+test("boot resume retires a one-shot subscription after reporting the interruption", async () => {
+  const scenario = createFinishNotificationScenario({
+    childNotifyLabel: "once:caller-agent",
+    childLastStatus: "running",
+  });
+
+  await scenario.resumeOnBoot();
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  expect(scenario.parentPrompts()[0]).toContain("was interrupted by a daemon restart.");
+  expect(scenario.subscriptionCount("child-agent")).toBe(0);
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({ [NOTIFY_ON_FINISH_LABEL]: "" }),
+  );
+});
+
+test("boot resume reports an undelivered finish for a one-shot child idle at shutdown", async () => {
+  const scenario = createFinishNotificationScenario({
+    childNotifyLabel: "once:caller-agent",
+    childLastStatus: "idle",
+  });
+
+  await scenario.resumeOnBoot();
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  expect(scenario.parentPrompts()[0]).toContain(
+    "Agent child-agent (Child Agent) ended before a daemon restart could deliver its notification.",
+  );
+  expect(scenario.parentPrompts()[0]).not.toContain("interrupted");
+});
+
+test("a caller whose provider declines finish notifications is never subscribed", async () => {
+  const scenario = createFinishNotificationScenario({ callerDeclinesFinishNotifications: true });
+
+  scenario.startWatchingChild({ persistent: true });
+  expect(scenario.subscriptionCount("child-agent")).toBe(0);
+
+  scenario.finishChild();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(scenario.parentPrompts()).toHaveLength(0);
+  expect(scenario.labelWrites()).toHaveLength(0);
+});
+
+test("an existing subscription ends once the caller's provider declines notifications", async () => {
+  const scenario = createFinishNotificationScenario();
+
+  scenario.startWatchingChild({ persistent: true });
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({
+      [NOTIFY_ON_FINISH_LABEL]: "always:caller-agent",
+    }),
+  );
+
+  scenario.setCallerDeclinesFinishNotifications(true);
+  scenario.finishChild();
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({ [NOTIFY_ON_FINISH_LABEL]: "" }),
+  );
+  expect(scenario.subscriptionCount("child-agent")).toBe(0);
+  expect(scenario.parentPrompts()).toHaveLength(0);
+});
+
+test("boot resume does not report to an unloaded caller whose provider declines", async () => {
+  const scenario = createFinishNotificationScenario({
+    childNotifyLabel: "once:caller-agent",
+    childLastStatus: "running",
+    callerDeclinesFinishNotifications: true,
+    callerUnloaded: true,
+  });
+
+  await scenario.resumeOnBoot();
+  await vi.waitFor(() =>
+    expect(scenario.labelWrites()).toContainEqual({ [NOTIFY_ON_FINISH_LABEL]: "" }),
+  );
+  expect(scenario.parentPrompts()).toHaveLength(0);
+});
+
+test("notifications drain to a caller resting in the error lifecycle", async () => {
+  const scenario = createFinishNotificationScenario({
+    callerInitiallyRunning: true,
+    parentPromptErrors: [new Error("Agent caller-agent already has an active run")],
+  });
+
+  scenario.startWatchingChild();
+  scenario.finishChild();
+  await vi.waitFor(() => expect(scenario.subscriptionCount("caller-agent")).toBe(1));
+  expect(scenario.parentPrompts()).toHaveLength(0);
+
+  scenario.setCallerLifecycle("error");
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  expect(scenario.parentPrompts()[0]).toContain("finished.");
+});
+
+test("a follow-up watch without an explicit mode inherits persistence", async () => {
+  const scenario = createFinishNotificationScenario();
+
+  scenario.startWatchingChild({ persistent: true });
+  scenario.startWatchingChild();
+
+  const firstPrompt = await scenario.finishChildAndReadParentPrompt();
+  expect(firstPrompt).toContain("finished.");
+  expect(scenario.subscriptionCount("child-agent")).toBe(1);
+
+  const secondPrompt = await scenario.finishChildAndReadParentPrompt();
+  expect(secondPrompt).toContain("finished.");
+});
+
+test("parseNotifyOnFinishLabel handles modes, callers, and opt-outs", () => {
+  expect(parseNotifyOnFinishLabel({ [NOTIFY_ON_FINISH_LABEL]: "always:caller-1" })).toEqual({
+    mode: "always",
+    callerAgentId: "caller-1",
+  });
+  expect(parseNotifyOnFinishLabel({ [NOTIFY_ON_FINISH_LABEL]: "always" })).toEqual({
+    mode: "always",
+    callerAgentId: null,
+  });
+  expect(parseNotifyOnFinishLabel({ [NOTIFY_ON_FINISH_LABEL]: "once:caller-1" })).toEqual({
+    mode: "once",
+    callerAgentId: "caller-1",
+  });
+  expect(parseNotifyOnFinishLabel({ [NOTIFY_ON_FINISH_LABEL]: "" })).toBeNull();
+  expect(parseNotifyOnFinishLabel({ [NOTIFY_ON_FINISH_LABEL]: "off" })).toBeNull();
+  expect(parseNotifyOnFinishLabel({})).toBeNull();
+  expect(parseNotifyOnFinishLabel(null)).toBeNull();
+});
+
 test("finish notifications log a rejected parent prompt without an unhandled rejection", async () => {
   const captured = createCapturedLogger();
   const scenario = createFinishNotificationScenario({
@@ -449,6 +899,11 @@ test("finish notifications log a rejected parent prompt without an unhandled rej
       err: expect.objectContaining({ message: "parent provider rejected replacement" }),
     }),
   ]);
+  scenario.setCallerLifecycle("running");
+  scenario.setCallerLifecycle("idle");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(captured.records).toHaveLength(1);
+  expect(scenario.subscriptionCount("caller-agent")).toBe(0);
 });
 
 it("does not notify archived callers", async () => {
@@ -501,13 +956,15 @@ it("does not notify archived callers", async () => {
   );
   const agentStorage: AgentStorage = Object.create(AgentStorage.prototype);
   Reflect.set(agentStorage, "get", agentStorageGetSpy);
+  const logger = createTestLogger();
+  const warnSpy = vi.spyOn(logger, "warn");
 
   setupFinishNotification({
     agentManager,
     agentStorage,
     childAgentId: "child-agent",
     callerAgentId: "caller-agent",
-    logger: createTestLogger(),
+    logger,
   });
 
   expect(subscriber).not.toBeNull();
@@ -530,6 +987,10 @@ it("does not notify archived callers", async () => {
 
   expect(streamAgentSpy).not.toHaveBeenCalled();
   expect(replaceAgentRunSpy).not.toHaveBeenCalled();
+  expect(warnSpy).toHaveBeenCalledWith(
+    expect.objectContaining({ cause: "archived", reason: "finished" }),
+    "Abandoned caller agent notification",
+  );
 });
 
 // Deliberately independent literals rather than the production constants these tests

@@ -31,6 +31,9 @@ export const ProviderRuntimeSettingsSchema = z.object({
 export const ProviderPaseoToolsPolicySchema = z.object({
   enabled: z.boolean().optional(),
   disabledTools: z.array(z.string()).optional(),
+  // false: agents of this provider never subscribe to finish notifications from
+  // agents they create or prompt; they observe them through status polling instead.
+  finishNotifications: z.boolean().optional(),
 });
 
 const ProviderProfileThinkingOptionSchema = z.object({
