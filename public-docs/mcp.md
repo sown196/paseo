@@ -12,12 +12,32 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                       | Default | Purpose                                            |
-| ----------------------------- | ------- | -------------------------------------------------- |
-| `daemon.mcp.enabled`          | `true`  | Run the MCP server.                                |
-| `daemon.mcp.injectIntoAgents` | `false` | Give agents launched by Paseo access to its tools. |
+| Setting                            | Default | Purpose                                            |
+| ---------------------------------- | ------- | -------------------------------------------------- |
+| `daemon.mcp.enabled`               | `true`  | Run the MCP server.                                |
+| `daemon.mcp.injectIntoAgents`      | `false` | Give agents launched by Paseo access to its tools. |
+| `daemon.mcp.injectIntoProviders`   | _unset_ | Restrict injection to an allowlist of provider IDs. |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
+
+### Limit injection to specific providers
+
+To limit injection to specific configured provider IDs, add `injectIntoProviders`:
+
+```json
+{
+  "daemon": {
+    "mcp": {
+      "injectIntoAgents": true,
+      "injectIntoProviders": ["codex-supervisor", "codex-lead"]
+    }
+  }
+}
+```
+
+The list matches exact configured IDs. In this example, `codex-lead` is eligible for Paseo tools and `codex-peer` is not, even if both extend `codex`. Omit `injectIntoProviders` to make every provider eligible. Set it to `[]` to inject into none. When using the daemon config patch API, send `null` to remove the allowlist and restore the omitted behavior. Persisted configuration never stores `null`. This policy covers native tool delivery and the MCP fallback for new, resumed, reloaded, and imported sessions.
+
+File edits to `injectIntoProviders` require a daemon restart; `paseo reload` reports the change but keeps the live allowlist. Explicit daemon config patches update the live allowlist. Provider policies below can only narrow tool access within that list.
 
 ## Limit Paseo tools by provider
 
@@ -59,10 +79,11 @@ tool injection globally, then add `paseoTools` to the exact provider IDs you lau
 }
 ```
 
-Run `paseo reload` after editing `~/.paseo/config.json`, then start a new agent or reload an
-existing one. A running session keeps the catalog it received at launch.
+Run `paseo reload` after editing provider policies in `~/.paseo/config.json`, then start a new
+agent or reload an existing one. A running session keeps the catalog it received at launch.
 
-Omitting `paseoTools` enables the complete catalog. Set `enabled` to `false` to remove the catalog,
+Omitting `paseoTools` enables the complete catalog for a provider allowed by the global settings
+and `injectIntoProviders`. Set `enabled` to `false` to remove the catalog,
 or list exact tool IDs in `disabledTools` to remove selected tools. Custom profiles do not inherit
 this policy from `extends`; configure each custom provider ID separately.
 

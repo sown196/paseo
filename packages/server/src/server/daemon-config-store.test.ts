@@ -133,7 +133,6 @@ describe("DaemonConfigStore", () => {
       enableTerminalAgentHooks: false,
       appendSystemPrompt: "",
     });
-
     store.patch({
       agentProfiles: [
         {
@@ -188,6 +187,92 @@ describe("DaemonConfigStore", () => {
 
     expect(store.get().agentProfiles).toEqual([{ id: "a", name: "Keep", provider: "claude" }]);
     expect(loadPersistedConfig(paseoHome).daemon?.agentProfiles).toHaveLength(1);
+  });
+
+  test("patch can set and reset the provider injection allowlist", () => {
+    const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-daemon-config-store-"));
+    tempDirs.push(paseoHome);
+    const store = new DaemonConfigStore(paseoHome, {
+      relay: { enabled: false },
+      mcp: { injectIntoAgents: true },
+      browserTools: { enabled: false },
+      providers: {},
+      metadataGeneration: { providers: [] },
+      autoArchiveAfterMerge: false,
+      enableTerminalAgentHooks: false,
+      appendSystemPrompt: "",
+    });
+
+    const changes: unknown[] = [];
+    store.onFieldChange("mcp.injectIntoProviders", (value) => changes.push(value));
+
+    store.patch({
+      mcp: { injectIntoProviders: ["codex-supervisor", "codex-lead"] },
+    });
+
+    expect(changes).toEqual([["codex-supervisor", "codex-lead"]]);
+    expect(loadPersistedConfig(paseoHome).daemon?.mcp).toEqual({
+      injectIntoProviders: ["codex-supervisor", "codex-lead"],
+    });
+
+    const reset = store.patch({ mcp: { injectIntoProviders: null } });
+
+    expect(reset.mcp).toEqual({ injectIntoAgents: true });
+    expect(changes).toEqual([["codex-supervisor", "codex-lead"], undefined]);
+    expect(loadPersistedConfig(paseoHome).daemon?.mcp).toEqual({});
+  });
+
+  test("reload applies provider policy without widening the restart-scoped allowlist", () => {
+    const paseoHome = mkdtempSync(path.join(tmpdir(), "paseo-daemon-config-store-"));
+    tempDirs.push(paseoHome);
+    const startupPersisted: PersistedConfig = {
+      version: 1,
+      daemon: { mcp: { injectIntoProviders: ["codex-lead"] } },
+    };
+    const initial = reloadableConfig(startupPersisted);
+    initial.mcp.injectIntoProviders = ["codex-lead"];
+    const store = new DaemonConfigStore(paseoHome, initial, undefined, {
+      startupPersisted,
+      reloadSource: {
+        resolve: (persisted) => {
+          const mutable = reloadableConfig(persisted);
+          mutable.mcp.injectIntoProviders = persisted.daemon?.mcp?.injectIntoProviders;
+          return { mutable, overrideControlledPaths: [] };
+        },
+      },
+    });
+    const changes: unknown[] = [];
+    store.onFieldChange("mcp.injectIntoProviders", (value) => changes.push(value));
+    writeFileSync(
+      path.join(paseoHome, "config.json"),
+      JSON.stringify({
+        version: 1,
+        daemon: { mcp: { injectIntoProviders: ["codex-lead", "codex-peer"] } },
+        agents: {
+          providers: {
+            "codex-lead": {
+              extends: "codex",
+              label: "Codex Lead",
+              paseoTools: { disabledTools: ["create_agent"] },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = store.reload();
+
+    expect(result.appliedPaths).toEqual(["agents.providers"]);
+    expect(result.restartRequiredPaths).toEqual(["daemon.mcp.injectIntoProviders"]);
+    expect(store.get().mcp.injectIntoProviders).toEqual(["codex-lead"]);
+    expect(store.get().providers["codex-lead"]?.paseoTools).toEqual({
+      disabledTools: ["create_agent"],
+    });
+    expect(changes).toEqual([]);
+    expect(loadPersistedConfig(paseoHome).daemon?.mcp?.injectIntoProviders).toEqual([
+      "codex-lead",
+      "codex-peer",
+    ]);
   });
 
   test("rolls back config when a field transition fails", () => {
