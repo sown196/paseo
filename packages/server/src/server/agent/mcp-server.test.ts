@@ -212,6 +212,7 @@ function buildAgentManagerSpies() {
     archiveAgent: vi.fn().mockResolvedValue({ archivedAt: new Date().toISOString() }),
     notifyAgentState: vi.fn(),
     getAgent: vi.fn(),
+    resolveProviderPaseoToolPolicy: vi.fn().mockReturnValue(undefined),
     listAgents: vi.fn().mockReturnValue([]),
     getTimeline: vi.fn().mockReturnValue([]),
     resumeAgentFromPersistence: vi.fn(),
@@ -3719,6 +3720,54 @@ describe("send_agent_prompt MCP tool", () => {
     expect(response.structuredContent.guidance).toBe(
       "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.",
     );
+  });
+
+  it("skips finish notifications when the caller's provider declines them", async () => {
+    const { agentManager, agentStorage, spies } = createTestDeps();
+    const supervisorAgent = {
+      id: "supervisor-agent",
+      cwd: existingCwd,
+      workspaceId: "wks_parent",
+      provider: "claude-supervisor",
+      currentModeId: "bypassPermissions",
+    } as ManagedAgent;
+    const leadAgent = {
+      id: "lead-agent",
+      cwd: existingCwd,
+      lifecycle: "idle",
+      currentModeId: null,
+      availableModes: [],
+      config: { title: "Lead" },
+    } as ManagedAgent;
+    spies.agentManager.getAgent.mockImplementation((agentId: string) => {
+      if (agentId === "supervisor-agent") return supervisorAgent;
+      if (agentId === "lead-agent") return leadAgent;
+      return null;
+    });
+    spies.agentManager.resolveProviderPaseoToolPolicy.mockImplementation((provider: string) =>
+      provider === "claude-supervisor" ? { finishNotifications: false } : undefined,
+    );
+
+    const server = await createAgentMcpServer({
+      agentManager,
+      agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      callerAgentId: "supervisor-agent",
+      logger,
+    });
+
+    const tool = registeredTool(server, "send_agent_prompt");
+    const response = await tool.handler({
+      agentId: "lead-agent",
+      prompt: "Human approved X",
+      background: true,
+      notifyOnFinish: true,
+    });
+
+    expect(spies.agentManager.streamAgent).toHaveBeenCalledTimes(1);
+    expect(spies.agentManager.subscribe).not.toHaveBeenCalled();
+    expect(spies.agentManager.setLabels).not.toHaveBeenCalled();
+    expect(response.structuredContent.guidance).toBeUndefined();
   });
 
   it("keeps top-level prompts blocking by default", async () => {

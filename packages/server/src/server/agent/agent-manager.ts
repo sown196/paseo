@@ -847,6 +847,14 @@ export class AgentManager {
   }
 
   /**
+   * Current daemon-config policy for a provider. Unlike getPaseoToolPolicy this
+   * works for unloaded agents and reflects config edits made after launch.
+   */
+  resolveProviderPaseoToolPolicy(provider: AgentProvider): ProviderPaseoToolsPolicy | undefined {
+    return this.resolvePaseoToolPolicy(provider);
+  }
+
+  /**
    * Capability token the daemon's own MCP clients must present to the Agent MCP
    * endpoint when a daemon password is configured. Read by the per-client
    * session to authenticate its own MCP connection. Stays in the daemon — never
@@ -3174,7 +3182,9 @@ export class AgentManager {
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
     const agent = this.agents.get(agentId);
     if (!agent) {
-      return null;
+      // Unloaded agents still have a committed timeline; boot-time
+      // notification catch-up depends on reading it without a live session.
+      return (await this.durableTimelineStore?.getLastAssistantMessage(agentId)) ?? null;
     }
 
     return await this.getLastAssistantMessageFromStores(agentId);

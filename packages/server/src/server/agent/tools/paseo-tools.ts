@@ -60,7 +60,13 @@ import {
   toScheduleSummary,
   waitForAgentWithTimeout,
 } from "../mcp-shared.js";
-import { sendPromptToAgent, setupFinishNotification } from "../agent-prompt.js";
+import {
+  applyNotifyOnFinishLabelChange,
+  callerAcceptsFinishNotifications,
+  NOTIFY_ON_FINISH_LABEL,
+  sendPromptToAgent,
+  setupFinishNotification,
+} from "../agent-prompt.js";
 import { respondToAgentPermission } from "../permission-response.js";
 import {
   archiveAgentCommand,
@@ -997,6 +1003,12 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       .trim()
       .min(1, "initialPrompt is required")
       .describe("Required first task to run immediately after creation."),
+    notifyMode: z
+      .enum(["once", "always"])
+      .optional()
+      .describe(
+        "With notifyOnFinish: 'once' (default) notifies until the agent's next finish; 'always' keeps notifying for every later turn and permission request until the agent is archived or its paseo.notify-on-finish label is cleared.",
+      ),
   };
   const legacyCreateAgentPlacementFields = {
     relationship: AgentRelationshipInputSchema.describe(
@@ -1107,6 +1119,12 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     agentId: z.string(),
     prompt: z.string(),
     sessionMode: z.string().optional().describe("Optional mode to set before running the prompt."),
+    notifyMode: z
+      .enum(["once", "always"])
+      .optional()
+      .describe(
+        "With notifyOnFinish: 'once' (default) notifies until the agent's next finish; 'always' keeps notifying for every later turn and permission request until the agent is archived or its paseo.notify-on-finish label is cleared.",
+      ),
   };
   const agentToAgentSendAgentPromptInputSchema = {
     ...commonSendAgentPromptInputSchema,
@@ -1435,6 +1453,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
         requestedBackground = resolvedArgs.parsedArgs.background;
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
       }
+      if (callerAgentId && !callerAcceptsFinishNotifications({ agentManager, callerAgentId })) {
+        notifyOnFinish = false;
+      }
       const selectedProvider = resolveRequiredProviderModel(parsedArgs.provider).provider;
       const inheritedConfig = resolveInheritedProviderConfig(selectedProvider);
       const {
@@ -1469,6 +1490,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           mode: parsedArgs.settings?.modeId,
           background: requestedBackground,
           notifyOnFinish,
+          notifyMode: parsedArgs.notifyMode,
           detached: resolvedArgs.detached,
           callerAgentId,
           callerContext,
@@ -1886,8 +1908,14 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       sessionMode,
       background = Boolean(callerAgentId),
       notifyOnFinish = Boolean(callerAgentId),
+      notifyMode,
     }) => {
-      const shouldNotifyOnFinish = Boolean(callerAgentId && notifyOnFinish && background);
+      const shouldNotifyOnFinish = Boolean(
+        callerAgentId &&
+        notifyOnFinish &&
+        background &&
+        callerAcceptsFinishNotifications({ agentManager, callerAgentId }),
+      );
 
       await sendPromptToAgent({
         agentManager,
@@ -1904,6 +1932,9 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           agentStorage,
           childAgentId: agentId,
           callerAgentId,
+          // Undefined inherits an existing subscription's persistence, so a
+          // plain follow-up prompt cannot downgrade an "always" watch.
+          persistent: notifyMode === undefined ? undefined : notifyMode === "always",
           logger: childLogger,
         });
       }
@@ -2172,6 +2203,15 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       }
 
       await updateAgentCommand({ agentManager }, { agentId, name, labels });
+
+      if (labels && NOTIFY_ON_FINISH_LABEL in labels) {
+        await applyNotifyOnFinishLabelChange({
+          agentManager,
+          agentStorage,
+          childAgentId: agentId,
+          logger: childLogger,
+        });
+      }
 
       return {
         content: [],

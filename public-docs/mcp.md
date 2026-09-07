@@ -12,11 +12,11 @@ category: Orchestration
 
 ## Configuration
 
-| Setting                            | Default | Purpose                                            |
-| ---------------------------------- | ------- | -------------------------------------------------- |
-| `daemon.mcp.enabled`               | `true`  | Run the MCP server.                                |
-| `daemon.mcp.injectIntoAgents`      | `false` | Give agents launched by Paseo access to its tools. |
-| `daemon.mcp.injectIntoProviders`   | _unset_ | Restrict injection to an allowlist of provider IDs. |
+| Setting                          | Default | Purpose                                             |
+| -------------------------------- | ------- | --------------------------------------------------- |
+| `daemon.mcp.enabled`             | `true`  | Run the MCP server.                                 |
+| `daemon.mcp.injectIntoAgents`    | `false` | Give agents launched by Paseo access to its tools.  |
+| `daemon.mcp.injectIntoProviders` | _unset_ | Restrict injection to an allowlist of provider IDs. |
 
 Depending on the provider, Paseo delivers tools through its native tool interface or MCP. The capabilities are the same. Start a new agent or reload an existing one after changing injection settings.
 
@@ -86,6 +86,11 @@ Omitting `paseoTools` enables the complete catalog for a provider allowed by the
 and `injectIntoProviders`. Set `enabled` to `false` to remove the catalog,
 or list exact tool IDs in `disabledTools` to remove selected tools. Custom profiles do not inherit
 this policy from `extends`; configure each custom provider ID separately.
+
+Set `finishNotifications` to `false` for an observer seat that watches other agents through status
+checks or a heartbeat. Agents of that provider can still create and prompt agents, but are never
+woken when those agents finish, error, or need permission. Unlike the catalog, this field applies
+to running agents and existing subscriptions after `paseo reload`.
 
 Browser tools still require browser tools to be enabled and a connected browser host. The
 voice-only `speak` tool is separate from this policy.
