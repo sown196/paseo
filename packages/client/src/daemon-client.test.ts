@@ -64,11 +64,30 @@ function createMockTransport() {
   let onOpen: () => void = () => {};
   let onClose: (_event?: unknown) => void = () => {};
   let onError: (_event?: unknown) => void = () => {};
+  const sentListeners = new Set<(data: string | Uint8Array | ArrayBuffer) => void>();
   let serverInfoOrdinal = 1;
+  const triggerServerInfo = (features?: Record<string, boolean>) => {
+    onMessage(
+      JSON.stringify({
+        type: "session",
+        message: {
+          type: "status",
+          payload: {
+            status: "server_info",
+            serverId: `srv_test_${serverInfoOrdinal++}`,
+            hostname: null,
+            version: null,
+            ...(features ? { features } : {}),
+          },
+        },
+      }),
+    );
+  };
 
   const transport: DaemonTransport = {
     send: (data) => {
       sent.push(data);
+      for (const listener of sentListeners) listener(data);
       if (typeof data !== "string") {
         return;
       }
@@ -99,28 +118,34 @@ function createMockTransport() {
   return {
     transport,
     sent,
-    triggerOpen: (options?: { preserveSent?: boolean; features?: Record<string, boolean> }) => {
+    triggerOpen: (options?: {
+      preserveSent?: boolean;
+      features?: Record<string, boolean>;
+      sendServerInfo?: boolean;
+    }) => {
       onOpen();
       if (!options?.preserveSent) {
         // Ignore HELLO handshake payloads in assertions.
         sent.length = 0;
       }
-      onMessage(
-        JSON.stringify({
-          type: "session",
-          message: {
-            type: "status",
-            payload: {
-              status: "server_info",
-              serverId: `srv_test_${serverInfoOrdinal++}`,
-              hostname: null,
-              version: null,
-              ...(options?.features ? { features: options.features } : {}),
-            },
-          },
-        }),
-      );
+      if (options?.sendServerInfo === false) return;
+      triggerServerInfo(options?.features);
     },
+    triggerServerInfo,
+    waitForSent: (predicate: (data: string | Uint8Array | ArrayBuffer) => boolean) =>
+      new Promise<void>((resolve) => {
+        const existing = sent.find(predicate);
+        if (existing) {
+          resolve();
+          return;
+        }
+        const listener = (data: string | Uint8Array | ArrayBuffer) => {
+          if (!predicate(data)) return;
+          sentListeners.delete(listener);
+          resolve();
+        };
+        sentListeners.add(listener);
+      }),
     triggerClose: (event?: unknown) => onClose(event),
     triggerError: (event?: unknown) => onError(event),
     triggerMessage: (data: unknown) => onMessage(data),
@@ -989,12 +1014,20 @@ test("ensureConnected reconnects immediately without leaving the scheduled retry
     await initialConnect;
     first.triggerClose({ code: 1001, reason: "app resumed" });
     expect(client.getConnectionState().status).toBe("disconnected");
+    let settledWaiters = 0;
+    const firstWaiter = client.connect().then(() => settledWaiters++);
+    const secondWaiter = client.connect().then(() => settledWaiters++);
+    expect(transportIndex).toBe(1);
 
     client.ensureConnected();
     expect(client.getConnectionState().status).toBe("connecting");
     expect(transportIndex).toBe(2);
-
-    second.triggerOpen();
+    second.triggerOpen({ sendServerInfo: false });
+    await Promise.resolve();
+    expect(settledWaiters).toBe(0);
+    second.triggerServerInfo();
+    await Promise.all([firstWaiter, secondWaiter]);
+    expect(settledWaiters).toBe(2);
     expect(client.getConnectionState().status).toBe("connected");
     await vi.advanceTimersByTimeAsync(1_500);
 
@@ -1042,6 +1075,60 @@ test("disabling reconnect cancels a pending retry until explicitly resumed", asy
   } finally {
     vi.useRealTimers();
   }
+});
+test("rejects a synchronous initial connection failure when reconnect is disabled", async () => {
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "initial_factory_failure",
+    transportFactory: () => {
+      throw new Error("initial factory failed");
+    },
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  await expect(client.connect()).rejects.toThrow("initial factory failed");
+  expect(client.getConnectionState().status).toBe("disconnected");
+});
+
+test("rejects an initial connection wait when closed before server_info", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "close_before_server_info",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  const pendingConnect = client.connect();
+  expect(client.getConnectionState().status).toBe("connecting");
+  await client.close();
+
+  await expect(pendingConnect).rejects.toThrow("Daemon client closed");
+  expect(client.getConnectionState().status).toBe("disposed");
+});
+
+test("ensureConnected observes a reconnect wait that close rejects", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "ensure_connected_close",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  mock.triggerOpen();
+  await initialConnect;
+  mock.triggerClose({ code: 1006, reason: "lost" });
+  expect(client.getConnectionState().status).toBe("disconnected");
+
+  client.ensureConnected();
+  expect(client.getConnectionState().status).toBe("connecting");
+  await client.close();
+  expect(client.getConnectionState().status).toBe("disposed");
 });
 
 test("keeps the transport connected when a session RPC ping times out", async () => {
@@ -3526,6 +3613,309 @@ test("reconnects after relay close with replaced-by-new-connection reason", asyn
   } finally {
     vi.useRealTimers();
   }
+});
+
+test("provider-policy patch waits for supported reconnect handshake", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_reconnect_supported",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  await vi.advanceTimersByTimeAsync(5);
+  expect(client.getConnectionState().status).toBe("connecting");
+
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-reconnect-supported",
+  );
+  second.triggerOpen({ sendServerInfo: false });
+  expect(second.sent).toEqual([]);
+  second.triggerServerInfo({ providerScopedPaseoTools: true });
+  await second.waitForSent((data) => parseSentFrame(data).type === "set_daemon_config_request");
+  expect(parseSentFrame(second.sent.at(-1))).toMatchObject({
+    type: "set_daemon_config_request",
+    requestId: "provider-policy-reconnect-supported",
+  });
+  second.triggerMessage(
+    wrapSessionMessage({
+      type: "set_daemon_config_response",
+      payload: {
+        requestId: "provider-policy-reconnect-supported",
+        config: {
+          mcp: { injectIntoAgents: true, injectIntoProviders: ["codex-lead"] },
+          providers: {},
+          autoArchiveAfterMerge: false,
+        },
+      },
+    }),
+  );
+  await expect(patch).resolves.toMatchObject({ requestId: "provider-policy-reconnect-supported" });
+});
+
+test("provider-policy patch during reconnect backoff waits for the scheduled supported retry", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_backoff_supported",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  expect(client.getConnectionState().status).toBe("disconnected");
+
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-backoff-supported",
+  );
+  expect(transportIndex).toBe(1);
+  await vi.advanceTimersByTimeAsync(5);
+  expect(transportIndex).toBe(2);
+
+  second.triggerOpen({ sendServerInfo: false });
+  second.triggerServerInfo({ providerScopedPaseoTools: true });
+  await second.waitForSent((data) => parseSentFrame(data).type === "set_daemon_config_request");
+  expect(
+    second.sent.filter(
+      (data) =>
+        typeof data === "string" && parseSentFrame(data).type === "set_daemon_config_request",
+    ),
+  ).toHaveLength(1);
+  second.triggerMessage(
+    wrapSessionMessage({
+      type: "set_daemon_config_response",
+      payload: {
+        requestId: "provider-policy-backoff-supported",
+        config: {
+          mcp: { injectIntoAgents: true, injectIntoProviders: ["codex-lead"] },
+          providers: {},
+          autoArchiveAfterMerge: false,
+        },
+      },
+    }),
+  );
+  await expect(patch).resolves.toMatchObject({ requestId: "provider-policy-backoff-supported" });
+});
+
+test("provider-policy patch rejects unsupported reconnect handshake without sending", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_reconnect_unsupported",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  await vi.advanceTimersByTimeAsync(5);
+  expect(client.getConnectionState().status).toBe("connecting");
+
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-reconnect-unsupported",
+  );
+  second.triggerOpen({ sendServerInfo: false });
+  second.triggerServerInfo({});
+  await expect(patch).rejects.toThrow("Update the host to configure provider-scoped Paseo tools.");
+  expect(second.sent).toEqual([]);
+});
+
+test("provider-policy patch during reconnect backoff rejects unsupported retry without sending", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_backoff_unsupported",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-backoff-unsupported",
+  );
+  await vi.advanceTimersByTimeAsync(5);
+  second.triggerOpen({ sendServerInfo: false });
+  second.triggerServerInfo({});
+
+  await expect(patch).rejects.toThrow("Update the host to configure provider-scoped Paseo tools.");
+  expect(
+    second.sent.some(
+      (data) =>
+        typeof data === "string" && parseSentFrame(data).type === "set_daemon_config_request",
+    ),
+  ).toBe(false);
+});
+
+test("provider-policy wait survives a synchronous retry failure and later succeeds", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_retry_failure",
+    transportFactory: () => {
+      transportIndex += 1;
+      if (transportIndex === 1) return first.transport;
+      if (transportIndex === 2) throw new Error("retry factory failed");
+      return second.transport;
+    },
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 20 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-retry-failure",
+  );
+
+  await vi.advanceTimersByTimeAsync(5);
+  expect(transportIndex).toBe(2);
+  expect(client.getConnectionState().status).toBe("disconnected");
+  await vi.advanceTimersByTimeAsync(10);
+  expect(transportIndex).toBe(3);
+  expect(client.getConnectionState().status).toBe("connecting");
+
+  second.triggerOpen({ sendServerInfo: false });
+  second.triggerServerInfo({ providerScopedPaseoTools: true });
+  await second.waitForSent((data) => parseSentFrame(data).type === "set_daemon_config_request");
+  second.triggerMessage(
+    wrapSessionMessage({
+      type: "set_daemon_config_response",
+      payload: {
+        requestId: "provider-policy-retry-failure",
+        config: {
+          mcp: { injectIntoAgents: true, injectIntoProviders: ["codex-lead"] },
+          providers: {},
+          autoArchiveAfterMerge: false,
+        },
+      },
+    }),
+  );
+  await expect(patch).resolves.toMatchObject({ requestId: "provider-policy-retry-failure" });
+});
+
+test("close cancels a provider-policy wait during reconnect backoff", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_backoff_close",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-backoff-close",
+  );
+  await client.close();
+
+  await expect(patch).rejects.toThrow("Daemon client closed");
+  await vi.advanceTimersByTimeAsync(5);
+  expect(transportIndex).toBe(1);
+});
+
+test("ordinary RPCs still fail immediately while disconnected", async () => {
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "disconnected_rpc",
+    transportFactory: () => mock.transport,
+    reconnect: { enabled: false },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  mock.triggerOpen();
+  await initialConnect;
+  mock.triggerClose({ code: 1006, reason: "lost" });
+  expect(client.getConnectionState().status).toBe("disconnected");
+
+  await expect(client.getDaemonConfig()).rejects.toThrow(
+    "Transport not connected (status: disconnected)",
+  );
+});
+
+test("provider-policy patch rejects when reconnect closes before server_info", async () => {
+  useHeartbeatClock();
+  const first = createMockTransport();
+  const second = createMockTransport();
+  let transportIndex = 0;
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "provider_policy_reconnect_close",
+    transportFactory: () => (transportIndex++ === 0 ? first.transport : second.transport),
+    reconnect: { enabled: true, baseDelayMs: 5, maxDelayMs: 5 },
+  });
+  clients.push(client);
+
+  const initialConnect = client.connect();
+  first.triggerOpen({ features: { providerScopedPaseoTools: true } });
+  await initialConnect;
+  first.triggerClose({ code: 1006, reason: "lost" });
+  await vi.advanceTimersByTimeAsync(5);
+  expect(client.getConnectionState().status).toBe("connecting");
+
+  const patch = client.patchDaemonConfig(
+    { mcp: { injectIntoProviders: ["codex-lead"] } },
+    "provider-policy-reconnect-close",
+  );
+  second.triggerOpen({ preserveSent: true, sendServerInfo: false });
+  await client.close();
+
+  await expect(patch).rejects.toThrow("Daemon client closed");
+  expect(client.getConnectionState().status).toBe("disposed");
+  expect(
+    second.sent.some(
+      (data) =>
+        typeof data === "string" && JSON.parse(data).message?.type === "set_daemon_config_request",
+    ),
+  ).toBe(false);
 });
 
 test("requires non-empty clientId", () => {
