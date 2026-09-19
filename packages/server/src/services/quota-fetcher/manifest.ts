@@ -3,7 +3,7 @@ import type {
   ProviderUsageFetcherFactoryOptions,
   ProviderUsageFetcherManifestEntry,
 } from "./provider.js";
-import { ClaudeQuotaProvider } from "./providers/claude.js";
+import { ClaudeAccountsUsageFetcher } from "./providers/claude-accounts-fetcher.js";
 import { CodexQuotaProvider } from "./providers/codex.js";
 import { CopilotQuotaProvider } from "./providers/copilot.js";
 import { CursorQuotaProvider } from "./providers/cursor.js";
@@ -16,7 +16,7 @@ export const PROVIDER_USAGE_FETCHERS: readonly ProviderUsageFetcherManifestEntry
   {
     providerId: "claude",
     create: (options) =>
-      new ClaudeQuotaProvider({
+      new ClaudeAccountsUsageFetcher({
         logger: options.logger,
         fetch: options.fetch,
       }),

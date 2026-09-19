@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, promises as fs } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,22 @@ const execFileAsync = promisify(execFile);
 const CLAUDE_KEYCHAIN_TIMEOUT_MS = 2_000;
 const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
+
+/**
+ * Claude Code's Keychain service name for a given configuration home.
+ *
+ * The CLI appends a hash of the config dir only when CLAUDE_CONFIG_DIR is *set*, never
+ * because the path happens to differ from ~/.claude — so the default account, which runs
+ * without the variable, keeps the bare service name even though its home hashes to
+ * something. Passing `undefined` here models exactly that "variable not set" case.
+ *
+ * Mirrors the CLI: sha256 of the NFC-normalized dir, first 8 hex characters.
+ */
+export function claudeKeychainService(configDir?: string): string {
+  if (!configDir) return CLAUDE_KEYCHAIN_SERVICE;
+  const digest = createHash("sha256").update(configDir.normalize("NFC")).digest("hex");
+  return `${CLAUDE_KEYCHAIN_SERVICE}-${digest.slice(0, 8)}`;
+}
 
 const ClaudeCredentialsSchema = z.object({
   claudeAiOauth: z
@@ -86,6 +103,14 @@ interface ClaudeQuotaProviderOptions {
   claudeKeychainReader?: () => Promise<unknown | null>;
   platform?: typeof process.platform;
   fetch?: ProviderApiFetch;
+  /** Usage-row identity. Defaults to the single built-in Claude account. */
+  providerId?: string;
+  displayName?: string;
+  /**
+   * The account's CLAUDE_CONFIG_DIR, or undefined for the default account that runs
+   * without the variable. Selects both the credential file and the Keychain item.
+   */
+  configDir?: string;
 }
 
 function buildClaudePlan(
@@ -316,10 +341,11 @@ async function runSecurityCommand(args: string[]): Promise<string | null> {
 export async function readClaudeKeychainCredentials(
   run: ClaudeKeychainCommandRunner = runSecurityCommand,
   account: string = claudeKeychainAccount(),
+  service: string = CLAUDE_KEYCHAIN_SERVICE,
 ): Promise<unknown | null> {
   const lookups = [
-    ["find-generic-password", "-a", account, "-w", "-s", CLAUDE_KEYCHAIN_SERVICE],
-    ["find-generic-password", "-w", "-s", CLAUDE_KEYCHAIN_SERVICE],
+    ["find-generic-password", "-a", account, "-w", "-s", service],
+    ["find-generic-password", "-w", "-s", service],
   ];
 
   for (const args of lookups) {
@@ -338,8 +364,8 @@ export async function readClaudeKeychainCredentials(
 }
 
 export class ClaudeQuotaProvider implements ProviderUsageFetcher {
-  readonly providerId = "claude";
-  readonly displayName = "Claude";
+  readonly providerId: string;
+  readonly displayName: string;
 
   private readonly logger: Logger;
   private readonly claudeHome: string;
@@ -348,10 +374,21 @@ export class ClaudeQuotaProvider implements ProviderUsageFetcher {
   private readonly fetchApi: ProviderApiFetch;
 
   constructor(options: ClaudeQuotaProviderOptions) {
-    this.logger = options.logger.child({ module: "claude-quota-provider" });
+    this.providerId = options.providerId ?? "claude";
+    this.displayName = options.displayName ?? "Claude";
+    this.logger = options.logger.child({
+      module: "claude-quota-provider",
+      providerId: this.providerId,
+    });
     this.claudeHome =
-      options.claudeHome || process.env["CLAUDE_HOME"] || join(homedir(), ".claude");
-    this.readKeychainCredentials = options.claudeKeychainReader ?? readClaudeKeychainCredentials;
+      options.claudeHome ||
+      options.configDir ||
+      process.env["CLAUDE_HOME"] ||
+      join(homedir(), ".claude");
+    const service = claudeKeychainService(options.configDir);
+    this.readKeychainCredentials =
+      options.claudeKeychainReader ??
+      (() => readClaudeKeychainCredentials(undefined, undefined, service));
     this.platform = options.platform ?? process.platform;
     this.fetchApi = options.fetch ?? fetch;
   }

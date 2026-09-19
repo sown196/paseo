@@ -17,7 +17,24 @@ export interface ProviderUsageListResult {
   providers: ProviderUsage[];
 }
 
-const DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS = 5 * 60 * 1000;
+const DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * How long a usage snapshot is reused, overridable with PASEO_PROVIDER_USAGE_CACHE_TTL_MS.
+ *
+ * Every refresh costs one call per account, and these endpoints rate-limit per account
+ * rather than per client, so several seats sharing one login exhaust the quota together.
+ * Ten minutes stays far inside the shortest window any provider reports (five hours):
+ * caching longer trades away accuracy the windows themselves do not have.
+ */
+function resolveDefaultCacheTtlMs(): number {
+  // An empty or unparseable value means "unset", not "never cache": reading it as zero
+  // would turn every poll into a live call, which is the failure this cache exists to avoid.
+  const raw = process.env["PASEO_PROVIDER_USAGE_CACHE_TTL_MS"]?.trim();
+  if (!raw) return DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS;
+}
 
 export class ProviderUsageService {
   private readonly logger: Logger;
@@ -35,7 +52,7 @@ export class ProviderUsageService {
         logger: this.logger,
         fetch: options.fetch,
       });
-    this.cacheTtlMs = options.cacheTtlMs ?? DEFAULT_PROVIDER_USAGE_CACHE_TTL_MS;
+    this.cacheTtlMs = options.cacheTtlMs ?? resolveDefaultCacheTtlMs();
     this.now = options.now ?? Date.now;
   }
 
@@ -65,8 +82,14 @@ export class ProviderUsageService {
   }
 
   private async fetchFreshUsage(nowMs: number): Promise<ProviderUsageListResult> {
-    const settled = await Promise.allSettled(this.fetchers.map((fetcher) => fetcher.fetchUsage()));
-    const providers = settled.map((result, index) => {
+    const settled = await Promise.allSettled(
+      this.fetchers.map((fetcher) =>
+        fetcher.fetchUsageAll
+          ? fetcher.fetchUsageAll()
+          : fetcher.fetchUsage().then((usage) => [usage]),
+      ),
+    );
+    const providers = settled.flatMap((result, index) => {
       const fetcher = this.fetchers[index];
       if (result.status === "fulfilled") {
         return result.value;
@@ -75,11 +98,13 @@ export class ProviderUsageService {
         { err: result.reason, providerId: fetcher.providerId },
         "Provider usage fetch failed",
       );
-      return unavailableUsage({
-        providerId: fetcher.providerId,
-        displayName: fetcher.displayName,
-        error: result.reason instanceof Error ? result.reason.message : String(result.reason),
-      });
+      return [
+        unavailableUsage({
+          providerId: fetcher.providerId,
+          displayName: fetcher.displayName,
+          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        }),
+      ];
     });
 
     const result = { fetchedAt: new Date(nowMs).toISOString(), providers };

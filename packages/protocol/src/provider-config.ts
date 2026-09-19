@@ -54,6 +54,10 @@ export const ProviderProfileModelSchema = z.object({
 export const ProviderOverrideSchema = z.object({
   extends: z.string().optional(),
   label: z.string().optional(),
+  // Display name for this provider's Claude account in the usage surfaces. Providers that
+  // share a config dir are one account, so the label belongs to the account rather than the
+  // agent seat: "Claude Max Supervisor" and "Claude Max Lead" report as a single usage row.
+  usageLabel: z.string().optional(),
   description: z.string().optional(),
   command: z.array(z.string().min(1)).min(1).optional(),
   env: z.record(z.string(), z.string()).optional(),
