@@ -397,4 +397,41 @@ describe("ClaudeAgentSession history replay regression", () => {
       dryRun: false,
     });
   });
+
+  test("resolves history from the config dir in provider runtime settings", async () => {
+    const decoyConfigDir = path.join(tempRoot, "decoy-claude-config");
+    mkdirSync(decoyConfigDir, { recursive: true });
+    process.env.CLAUDE_CONFIG_DIR = decoyConfigDir;
+
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+      runtimeSettings: { env: { CLAUDE_CONFIG_DIR: configDir } },
+    });
+    const handle: AgentPersistenceHandle = {
+      provider: "claude",
+      sessionId: "history-session",
+      nativeHandle: "history-session",
+      metadata: {
+        provider: "claude",
+        cwd,
+      },
+    };
+
+    const session = await client.resumeSession(handle, { cwd });
+    const historyEvents: AgentStreamEvent[] = [];
+
+    try {
+      for await (const event of session.streamHistory()) {
+        historyEvents.push(event);
+      }
+    } finally {
+      await session.close();
+    }
+
+    const timelineText = collectTimelineText(historyEvents);
+    expect(timelineText).toContain(HISTORY_USER_MARKER);
+    expect(timelineText).toContain(HISTORY_ASSISTANT_MARKER);
+  });
 });
